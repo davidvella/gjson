@@ -2888,3 +2888,174 @@ func TestIssue407(t *testing.T) {
 	assert(t, Get(`[{"a":1},{ }]`, `@join:{"preserve":true}`).Raw == `{"a":1}`)
 	assert(t, Get(`[  { }  ,  {"a":1}]`, `@join:{"preserve":true}`).Raw == `{"a":1}`)
 }
+
+func TestForEachRaw(t *testing.T) {
+	// https://github.com/tidwall/gjson/issues/408
+	Result{}.ForEachRaw(nil)
+	Result{Type: String, Str: "Hello"}.ForEachRaw(func(key, value Result) bool {
+		assert(t, !key.Exists())
+		assert(t, value.String() == "Hello")
+		return false
+	})
+	Result{Type: JSON, Raw: "*invalid*"}.ForEachRaw(nil)
+	Parse(`{"bad`).ForEachRaw(nil)
+	Parse(`{"ok":"bad`).ForEachRaw(nil)
+	Parse(`{"ok":}`).ForEachRaw(nil)
+
+	doc := `{"esc\"key":"hello \"world\"","plain":"simple","num":-42.5,"sci":1.5e-3,"nan":NaN,"inf":Infinity,"t":true,"f":false,"n":null,"obj":{"a":"x\"y"},"arr":["x\"y",2]}`
+	want := []struct {
+		key string
+		typ Type
+		raw string
+	}{
+		{`esc"key`, String, `"hello \"world\""`},
+		{`plain`, String, `"simple"`},
+		{`num`, Number, `-42.5`},
+		{`sci`, Number, `1.5e-3`},
+		{`nan`, Number, `NaN`},
+		{`inf`, Number, `Infinity`},
+		{`t`, True, `true`},
+		{`f`, False, `false`},
+		{`n`, Null, `null`},
+		{`obj`, JSON, `{"a":"x\"y"}`},
+		{`arr`, JSON, `["x\"y",2]`},
+	}
+	var i int
+	Parse(doc).ForEachRaw(func(key, value Result) bool {
+		assert(t, key.Str == want[i].key)
+		assert(t, value.Type == want[i].typ)
+		assert(t, value.Raw == want[i].raw)
+		assert(t, value.Str == "")
+		assert(t, value.Num == 0)
+		assert(t, strings.HasPrefix(doc[value.Index:], value.Raw))
+		i++
+		return true
+	})
+	assert(t, i == len(want))
+
+	var count int
+	Parse(doc).ForEachRaw(func(_, _ Result) bool {
+		count++
+		return false
+	})
+	assert(t, count == 1)
+
+	Get(doc, "obj").ForEachRaw(func(key, value Result) bool {
+		assert(t, key.Str == "a")
+		assert(t, Parse(doc[key.Index:]).String() == "a")
+		assert(t, Parse(doc[value.Index:]).Raw == `"x\"y"`)
+		assert(t, value.Str == "")
+		return true
+	})
+
+	qdoc := `{"items":[{"name":"a\"1"},{"name":"b2"}]}`
+	var paths []string
+	Get(qdoc, "items.#.name").ForEachRaw(func(_, value Result) bool {
+		assert(t, value.Str == "")
+		paths = append(paths, value.Path(qdoc))
+		return true
+	})
+	assert(t, strings.Join(paths, ",") == "items.0.name,items.1.name")
+}
+
+func TestIterRaw(t *testing.T) {
+	json := `{"a":"x\"y","b":42.5,"c":true,"d":false,"e":null,"f":{"x":1},"g":[1,2]}`
+	wantKeys := []string{"a", "b", "c", "d", "e", "f", "g"}
+	wantRaw := []string{`"x\"y"`, `42.5`, `true`, `false`, `null`, `{"x":1}`, `[1,2]`}
+
+	i := 0
+	for key, value := range Parse(json).AllRaw() {
+		assert(t, key.String() == wantKeys[i])
+		assert(t, value.Raw == wantRaw[i])
+		assert(t, value.Str == "")
+		assert(t, value.Num == 0)
+		i++
+	}
+	assert(t, i == len(wantKeys))
+
+	i = 0
+	for value := range Parse(json).ValuesRaw() {
+		assert(t, value.Raw == wantRaw[i])
+		assert(t, value.Str == "")
+		assert(t, value.Num == 0)
+		i++
+	}
+	assert(t, i == len(wantRaw))
+
+	i = 0
+	for key := range Parse(json).Keys() {
+		assert(t, key.String() == wantKeys[i])
+		i++
+	}
+	assert(t, i == len(wantKeys))
+
+	var idx []string
+	for key := range Parse(`["x\"y",true,null]`).Keys() {
+		idx = append(idx, key.String())
+	}
+	assert(t, strings.Join(idx, ",") == "0,1,2")
+
+	var n int
+	for key := range Parse(`"hi"`).Keys() {
+		assert(t, !key.Exists())
+		n++
+	}
+	assert(t, n == 1)
+
+	var aKey string
+	for key := range Parse(`{"a":n}`).Keys() {
+		aKey = key.String()
+	}
+	assert(t, aKey == "a")
+
+	for _, empty := range []Result{
+		{},
+		{Type: JSON, Raw: "*invalid*"},
+		Parse(`{}`),
+		Parse(`[]`),
+		Parse(`{"bad`),
+		Parse(`{"ok":"bad`),
+		Parse(`{"ok":}`),
+	} {
+		for range empty.Keys() {
+			t.Fatal("expected no keys")
+		}
+	}
+}
+
+func benchEscapedJSON() Result {
+	return Parse(`{"id":"doc1","type":"schema","schema":"` +
+		strings.Repeat(`{\"k\":\"value\"},`, 250000) + `"}`)
+}
+
+func BenchmarkForEach(b *testing.B) {
+	res := benchEscapedJSON()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		res.ForEach(func(k, v Result) bool {
+			return k.Str != "" && v.Raw != ""
+		})
+	}
+}
+
+func BenchmarkForEachRaw(b *testing.B) {
+	res := benchEscapedJSON()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		res.ForEachRaw(func(k, v Result) bool {
+			return k.Str != "" && v.Raw != ""
+		})
+	}
+}
+
+func BenchmarkKeys(b *testing.B) {
+	res := benchEscapedJSON()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for k := range res.Keys() {
+			if k.Str == "" {
+				b.Fatal("empty")
+			}
+		}
+	}
+}
