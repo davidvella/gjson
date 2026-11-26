@@ -268,6 +268,19 @@ func (t Result) IsBool() bool {
 // the value of each item. If the result is not a JSON array or object, the
 // iterator will pass back one value equal to the result.
 func (t Result) ForEach(iterator func(key, value Result) bool) {
+	t.forEach(parseFull, iterator)
+}
+
+// ForEachRaw iterates through values like ForEach, populating value.Type,
+// value.Raw, and value.Index, while leaving value.Str and value.Num zero for
+// object and array elements. This avoids unescaping strings and parsing floats
+// when callers only inspect raw values; use Parse(value.Raw) to parse an
+// individual element on demand. Object keys are still unescaped.
+func (t Result) ForEachRaw(iterator func(key, value Result) bool) {
+	t.forEach(parseRaw, iterator)
+}
+
+func (t Result) forEach(mode parseMode, iterator func(key, value Result) bool) {
 	if !t.Exists() {
 		return
 	}
@@ -326,7 +339,7 @@ func (t Result) ForEach(iterator func(key, value Result) bool) {
 			break
 		}
 		s := i
-		i, value, ok = parseAny(json, i, true)
+		i, value, ok = parseAny(json, i, mode)
 		if !ok {
 			return
 		}
@@ -1774,7 +1787,7 @@ func parseArray(c *parseContext, i int, path string) (int, bool) {
 								break
 							}
 							if idx < len(c.json) && c.json[idx] != ']' {
-								_, res, ok := parseAny(c.json, idx, true)
+								_, res, ok := parseAny(c.json, idx, parseFull)
 								if ok {
 									res := res.Get(rp.alogkey)
 									if res.Exists() {
@@ -1939,7 +1952,7 @@ func ForEachLine(json string, iterator func(line Result) bool) {
 	var res Result
 	var i int
 	for {
-		i, res, _ = parseAny(json, i, true)
+		i, res, _ = parseAny(json, i, parseFull)
 		if !res.Exists() {
 			break
 		}
@@ -2419,19 +2432,29 @@ func stringLessInsensitive(a, b string) bool {
 	return len(a) < len(b)
 }
 
+type parseMode uint8
+
+const (
+	parseSkip parseMode = iota
+	parseRaw
+	parseFull
+)
+
 // parseAny parses the next value from a json string.
-// A Result is returned when the hit param is set.
-// The return values are (i int, res Result, ok bool)
-func parseAny(json string, i int, hit bool) (int, Result, bool) {
+// The mode controls whether Result is skipped, populated with only Type and
+// Raw, or fully parsed.
+// The return values are (i int, res Result, ok bool).
+func parseAny(json string, i int, mode parseMode) (int, Result, bool) {
 	var res Result
 	var val string
 	for ; i < len(json); i++ {
 		if json[i] == '{' || json[i] == '[' {
 			i, val = parseSquash(json, i)
-			if hit {
-				res.Raw = val
-				res.Type = JSON
+			if mode == parseSkip {
+				return i, res, true
 			}
+			res.Raw = val
+			res.Type = JSON
 			var tmp parseContext
 			tmp.value = res
 			fillIndex(json, &tmp)
@@ -2450,14 +2473,18 @@ func parseAny(json string, i int, hit bool) (int, Result, bool) {
 			if !ok {
 				return i, res, false
 			}
-			if hit {
-				res.Type = String
-				res.Raw = val
-				if vesc {
-					res.Str = unescape(val[1 : len(val)-1])
-				} else {
-					res.Str = val[1 : len(val)-1]
-				}
+			if mode == parseSkip {
+				return i, res, true
+			}
+			res.Type = String
+			res.Raw = val
+			if mode == parseRaw {
+				return i, res, true
+			}
+			if vesc {
+				res.Str = unescape(val[1 : len(val)-1])
+			} else {
+				res.Str = val[1 : len(val)-1]
 			}
 			return i, res, true
 		case 'n':
@@ -2469,27 +2496,32 @@ func parseAny(json string, i int, hit bool) (int, Result, bool) {
 		case 't', 'f':
 			vc := json[i]
 			i, val = parseLiteral(json, i)
-			if hit {
-				res.Raw = val
-				switch vc {
-				case 't':
-					res.Type = True
-				case 'f':
-					res.Type = False
-				}
+			if mode == parseSkip {
 				return i, res, true
 			}
+			res.Raw = val
+			switch vc {
+			case 't':
+				res.Type = True
+			case 'f':
+				res.Type = False
+			}
+			return i, res, true
 		case '+', '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
 			'i', 'I', 'N':
 			num = true
 		}
 		if num {
 			i, val = parseNumber(json, i)
-			if hit {
-				res.Raw = val
-				res.Type = Number
-				res.Num, _ = strconv.ParseFloat(val, 64)
+			if mode == parseSkip {
+				return i, res, true
 			}
+			res.Raw = val
+			res.Type = Number
+			if mode == parseRaw {
+				return i, res, true
+			}
+			res.Num, _ = strconv.ParseFloat(val, 64)
 			return i, res, true
 		}
 
@@ -3729,6 +3761,18 @@ func (t Result) All() iter.Seq2[Result, Result] {
 	}
 }
 
+// AllRaw iterates over a json result like All, but uses ForEachRaw so
+// value.Str and value.Num remain zero:
+//
+//	for key, value := range res.AllRaw() {
+//		fmt.Printf("%s %s\n", key, value.Raw)
+//	}
+func (t Result) AllRaw() iter.Seq2[Result, Result] {
+	return func(yield func(Result, Result) bool) {
+		t.ForEachRaw(yield)
+	}
+}
+
 // Keys iterates over a json result.
 // This works identically to ForEach, but allows modern Go loops:
 //
@@ -3737,7 +3781,7 @@ func (t Result) All() iter.Seq2[Result, Result] {
 //	}
 func (t Result) Keys() iter.Seq[Result] {
 	return func(yield func(Result) bool) {
-		t.ForEach(func(key, _ Result) bool {
+		t.forEach(parseSkip, func(key, _ Result) bool {
 			return yield(key)
 		})
 	}
@@ -3752,6 +3796,20 @@ func (t Result) Keys() iter.Seq[Result] {
 func (t Result) Values() iter.Seq[Result] {
 	return func(yield func(Result) bool) {
 		t.ForEach(func(_, value Result) bool {
+			return yield(value)
+		})
+	}
+}
+
+// ValuesRaw iterates over a json result like Values, but uses ForEachRaw so
+// value.Str and value.Num remain zero:
+//
+//	for value := range res.ValuesRaw() {
+//		fmt.Printf("%s\n", value.Raw)
+//	}
+func (t Result) ValuesRaw() iter.Seq[Result] {
+	return func(yield func(Result) bool) {
+		t.ForEachRaw(func(_, value Result) bool {
 			return yield(value)
 		})
 	}
